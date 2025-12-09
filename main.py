@@ -20,6 +20,13 @@ class Charge:
 
 
 class FieldLineSimulator:
+    # Configuration constants for field line simulation
+    CURVATURE_THRESHOLD = np.cos(np.radians(25))  # Detect ~25 degree turns
+    SEEDING_RADIUS_SCALE = 0.15  # Base radius for seeding points
+    SEEDING_CHARGE_OFFSET = 0.5  # Offset for charge magnitude in radius calculation
+    MIN_LINE_LENGTH = 2  # Minimum points for a valid field line
+    FIELD_MAGNITUDE_MIN = 1e-8  # Threshold for equilibrium point detection
+    
     def __init__(self):
         # default charges
         self.charges = [Charge(0.0, 0.6, -1.0), Charge(-0.6, -0.3, +1.0), Charge(0.6, -0.3, -1.0)]
@@ -110,39 +117,37 @@ class FieldLineSimulator:
             min_dist = np.sqrt(min_dist_sq)
             dist_factor = max(0.1, min(1.0, min_dist / 0.2))
             
-            # Take a step and get field magnitude
-            x_new, y_new, field_mag = self.rk4_step(x, y, h * dist_factor, dir=dir)
-            
             # 2. Field magnitude (smaller steps in weak fields for better accuracy)
+            # Get current field magnitude
+            E = dir * self.E_at(x, y)
+            field_mag = np.sqrt(E[0]*E[0] + E[1]*E[1])
             mag_factor = max(0.3, min(2.0, 1.0 / (field_mag + 0.1)))
             
             # 3. Curvature (detect sharp turns)
             if i > 0:
                 dx_old = x - prev_x
                 dy_old = y - prev_y
-                dx_new = x_new - x
-                dy_new = y_new - y
-                # Approximate curvature by angle change
-                dot = dx_old*dx_new + dy_old*dy_new
                 len_old = np.sqrt(dx_old*dx_old + dy_old*dy_old)
-                len_new = np.sqrt(dx_new*dx_new + dy_new*dy_new)
-                if len_old > 1e-10 and len_new > 1e-10:
-                    cos_angle = dot / (len_old * len_new)
+                if len_old > 1e-10 and field_mag > 1e-10:
+                    # Predict next position direction
+                    E_norm = E / field_mag
+                    # Compare with previous direction
+                    cos_angle = (dx_old*E_norm[0] + dy_old*E_norm[1]) / len_old
                     cos_angle = max(-1.0, min(1.0, cos_angle))
                     # Reduce step size if angle changes significantly
-                    if cos_angle < 0.9:  # ~25 degree change
+                    if cos_angle < self.CURVATURE_THRESHOLD:
                         mag_factor *= 0.5
             
             # Combined adaptive step
             h_loc = h * dist_factor * mag_factor
             
-            # Apply step with adaptive size
+            # Apply RK4 step with adaptive size (single call per iteration)
             prev_x, prev_y = x, y
             x, y, _ = self.rk4_step(x, y, h_loc, dir=dir)
             xs[i+1], ys[i+1] = x, y
             
             # Stop if field is too weak (equilibrium point)
-            if field_mag < 1e-8:
+            if field_mag < self.FIELD_MAGNITUDE_MIN:
                 return xs[:i+2], ys[:i+2], None
             
             # stop if we hit a charge
@@ -167,7 +172,7 @@ class FieldLineSimulator:
             angles = np.linspace(0, 2*np.pi, n_lines, endpoint=False)
             
             # Seeding distance proportional to charge magnitude (closer for weaker charges)
-            r = 0.15 / np.sqrt(abs(c.q) + 0.5)
+            r = self.SEEDING_RADIUS_SCALE / np.sqrt(abs(c.q) + self.SEEDING_CHARGE_OFFSET)
             
             if c.q > 0:
                 # Positive charges -> integrate forward
@@ -176,7 +181,7 @@ class FieldLineSimulator:
                     y0 = c.y + r*np.sin(angle)
                     xs, ys, hit = self.trace_line(x0, y0, dir=1, h=h, max_steps=max_steps, stop_radius=stop_radius)
                     # Keep ALL lines - don't filter by destination
-                    if len(xs) > 2:  # Only keep if line actually went somewhere
+                    if len(xs) > self.MIN_LINE_LENGTH:  # Only keep if line actually went somewhere
                         lines.append((xs, ys))
             else:
                 # Negative charges -> integrate backward (follow -E) to find origins
@@ -185,7 +190,7 @@ class FieldLineSimulator:
                     y0 = c.y + r*np.sin(angle)
                     xs, ys, hit = self.trace_line(x0, y0, dir=-1, h=h, max_steps=max_steps, stop_radius=stop_radius)
                     # Keep ALL lines - don't filter by origin
-                    if len(xs) > 2:
+                    if len(xs) > self.MIN_LINE_LENGTH:
                         # reverse to have arrow flow from + to - when plotting
                         lines.append((xs[::-1], ys[::-1]))
         
