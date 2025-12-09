@@ -54,41 +54,104 @@ class FieldLineSimulator:
             Ey += factor * dy
         return np.array([Ex, Ey])
 
-    # RK4 step; dir=+1 follow E, dir=-1 follow -E (optimized with simpler Euler for speed)
+    # RK4 step; dir=+1 follow E, dir=-1 follow -E - true RK4 integration
     def rk4_step(self, x, y, h, dir=1):
-        # Use simpler Euler method for speed - accuracy less critical for visualization
-        E = dir * self.E_at(x, y)
-        mag = np.sqrt(E[0]*E[0] + E[1]*E[1])
-        if mag < 1e-10:
-            return x, y  # no field, don't move
-        # Normalize and step
-        E = E / mag
-        return x + h*E[0], y + h*E[1]
+        # Proper RK4 integration that respects field magnitude
+        k1 = dir * self.E_at(x, y)
+        mag1 = np.sqrt(k1[0]*k1[0] + k1[1]*k1[1])
+        if mag1 < 1e-10:
+            return x, y, mag1  # no field, don't move
+        k1_norm = k1 / mag1
+        
+        k2 = dir * self.E_at(x + 0.5*h*k1_norm[0], y + 0.5*h*k1_norm[1])
+        mag2 = np.sqrt(k2[0]*k2[0] + k2[1]*k2[1])
+        if mag2 < 1e-10:
+            return x, y, mag1
+        k2_norm = k2 / mag2
+        
+        k3 = dir * self.E_at(x + 0.5*h*k2_norm[0], y + 0.5*h*k2_norm[1])
+        mag3 = np.sqrt(k3[0]*k3[0] + k3[1]*k3[1])
+        if mag3 < 1e-10:
+            return x, y, mag1
+        k3_norm = k3 / mag3
+        
+        k4 = dir * self.E_at(x + h*k3_norm[0], y + h*k3_norm[1])
+        mag4 = np.sqrt(k4[0]*k4[0] + k4[1]*k4[1])
+        if mag4 < 1e-10:
+            return x, y, mag1
+        k4_norm = k4 / mag4
+        
+        # Weighted average for direction
+        E_avg = (k1_norm + 2*k2_norm + 2*k3_norm + k4_norm) / 6.0
+        E_avg_mag = np.sqrt(E_avg[0]*E_avg[0] + E_avg[1]*E_avg[1])
+        
+        # Average magnitude for adaptive stepping
+        mag_avg = (mag1 + 2*mag2 + 2*mag3 + mag4) / 6.0
+        
+        if E_avg_mag < 1e-10:
+            return x, y, mag_avg
+        E_avg_norm = E_avg / E_avg_mag
+        
+        return x + h*E_avg_norm[0], y + h*E_avg_norm[1], mag_avg
 
-    # Trace a single line starting from (x0,y0). dir=+1 forward along E, dir=-1 backward. (optimized)
+    # Trace a single line starting from (x0,y0). dir=+1 forward along E, dir=-1 backward.
     def trace_line(self, x0, y0, dir=1, h=0.03, max_steps=2000, stop_radius=0.08):
         # Pre-allocate arrays for speed
         xs = np.zeros(max_steps + 1)
         ys = np.zeros(max_steps + 1)
         xs[0], ys[0] = x0, y0
         x, y = x0, y0
+        prev_x, prev_y = x0, y0
         
         for i in range(max_steps):
-            # Simplified adaptive step
+            # Adaptive step sizing based on multiple factors:
+            # 1. Proximity to charges (smaller steps near singularities)
             min_dist_sq = min((x - c.x)**2 + (y - c.y)**2 for c in self.charges)
             min_dist = np.sqrt(min_dist_sq)
-            h_loc = h * max(0.1, min(1.0, min_dist / 0.3))  # Less aggressive adaptation
+            dist_factor = max(0.1, min(1.0, min_dist / 0.2))
             
-            x, y = self.rk4_step(x, y, h_loc, dir=dir)
+            # Take a step and get field magnitude
+            x_new, y_new, field_mag = self.rk4_step(x, y, h * dist_factor, dir=dir)
+            
+            # 2. Field magnitude (smaller steps in weak fields for better accuracy)
+            mag_factor = max(0.3, min(2.0, 1.0 / (field_mag + 0.1)))
+            
+            # 3. Curvature (detect sharp turns)
+            if i > 0:
+                dx_old = x - prev_x
+                dy_old = y - prev_y
+                dx_new = x_new - x
+                dy_new = y_new - y
+                # Approximate curvature by angle change
+                dot = dx_old*dx_new + dy_old*dy_new
+                len_old = np.sqrt(dx_old*dx_old + dy_old*dy_old)
+                len_new = np.sqrt(dx_new*dx_new + dy_new*dy_new)
+                if len_old > 1e-10 and len_new > 1e-10:
+                    cos_angle = dot / (len_old * len_new)
+                    cos_angle = max(-1.0, min(1.0, cos_angle))
+                    # Reduce step size if angle changes significantly
+                    if cos_angle < 0.9:  # ~25 degree change
+                        mag_factor *= 0.5
+            
+            # Combined adaptive step
+            h_loc = h * dist_factor * mag_factor
+            
+            # Apply step with adaptive size
+            prev_x, prev_y = x, y
+            x, y, _ = self.rk4_step(x, y, h_loc, dir=dir)
             xs[i+1], ys[i+1] = x, y
+            
+            # Stop if field is too weak (equilibrium point)
+            if field_mag < 1e-8:
+                return xs[:i+2], ys[:i+2], None
             
             # stop if we hit a charge
             for c in self.charges:
-                if (x - c.x)**2 + (y - c.y)**2 < stop_radius**2:  # avoid sqrt
+                if (x - c.x)**2 + (y - c.y)**2 < stop_radius**2:
                     return xs[:i+2], ys[:i+2], c
             
             # stop if out of bounds
-            if x*x + y*y > 25:  # faster than abs
+            if x*x + y*y > 25:
                 return xs[:i+2], ys[:i+2], None
         
         return xs, ys, None
@@ -96,35 +159,36 @@ class FieldLineSimulator:
     # Build all field lines with seeds near positive charges (forward) and near negative charges (backward)
     def build_field_lines(self, n_per_charge=24, h=0.03, max_steps=2000, stop_radius=0.08):
         lines = []  # each item: (xs, ys)
-        # Pre-compute angles once
-        angles = np.linspace(0, 2*np.pi, n_per_charge, endpoint=False)
-        cos_angles = np.cos(angles)
-        sin_angles = np.sin(angles)
-        r = 0.18
         
-        # Positive charges -> integrate forward
+        # Adaptive seeding based on charge magnitude
         for c in self.charges:
-            if c.q <= 0:
-                continue
-            for cos_a, sin_a in zip(cos_angles, sin_angles):
-                x0 = c.x + r*cos_a
-                y0 = c.y + r*sin_a
-                xs, ys, hit = self.trace_line(x0, y0, dir=1, h=h, max_steps=max_steps, stop_radius=stop_radius)
-                # Only keep if it ended in a negative charge
-                if hit is not None and hit.q < 0:
-                    lines.append((xs, ys))
+            # More lines for larger charges
+            n_lines = max(8, int(n_per_charge * np.sqrt(abs(c.q))))
+            angles = np.linspace(0, 2*np.pi, n_lines, endpoint=False)
+            
+            # Seeding distance proportional to charge magnitude (closer for weaker charges)
+            r = 0.15 / np.sqrt(abs(c.q) + 0.5)
+            
+            if c.q > 0:
+                # Positive charges -> integrate forward
+                for angle in angles:
+                    x0 = c.x + r*np.cos(angle)
+                    y0 = c.y + r*np.sin(angle)
+                    xs, ys, hit = self.trace_line(x0, y0, dir=1, h=h, max_steps=max_steps, stop_radius=stop_radius)
+                    # Keep ALL lines - don't filter by destination
+                    if len(xs) > 2:  # Only keep if line actually went somewhere
+                        lines.append((xs, ys))
+            else:
+                # Negative charges -> integrate backward (follow -E) to find origins
+                for angle in angles:
+                    x0 = c.x + r*np.cos(angle)
+                    y0 = c.y + r*np.sin(angle)
+                    xs, ys, hit = self.trace_line(x0, y0, dir=-1, h=h, max_steps=max_steps, stop_radius=stop_radius)
+                    # Keep ALL lines - don't filter by origin
+                    if len(xs) > 2:
+                        # reverse to have arrow flow from + to - when plotting
+                        lines.append((xs[::-1], ys[::-1]))
         
-        # Negative charges -> integrate backward (follow -E) to find origins at positives
-        for c in self.charges:
-            if c.q >= 0:
-                continue
-            for cos_a, sin_a in zip(cos_angles, sin_angles):
-                x0 = c.x + r*cos_a
-                y0 = c.y + r*sin_a
-                xs, ys, hit = self.trace_line(x0, y0, dir=-1, h=h, max_steps=max_steps, stop_radius=stop_radius)
-                if hit is not None and hit.q > 0:
-                    # reverse to have arrow flow from + to - when plotting
-                    lines.append((xs[::-1], ys[::-1]))
         return lines
 
 
@@ -381,7 +445,7 @@ class FieldLineGUI:
         
         # Ultra-fast preview: minimal lines, larger steps
         self.ax.clear()
-        lines = self.sim.build_field_lines(n_per_charge=4, h=0.08, max_steps=400, stop_radius=0.1)
+        lines = self.sim.build_field_lines(n_per_charge=6, h=0.08, max_steps=400, stop_radius=0.1)
         for xs, ys in lines:
             self.ax.plot(xs, ys, color='darkorange', linewidth=0.6, alpha=0.7)
         
